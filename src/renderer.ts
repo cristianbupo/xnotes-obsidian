@@ -2,6 +2,7 @@ import type { TextFlow } from "./flow.ts";
 import { paintFlowPage, type PageFlow } from "./flowLayout.ts";
 import type { MathPlacement, MathSetter } from "./math.ts";
 import { buildStrokeGeometry, type StrokeGeometry } from "./strokeEngine.ts";
+import { SvgContext, SvgPath } from "./svgContext.ts";
 import { fontFamily, PT_TO_PX, rgbaCss } from "./text.ts";
 import type {
 	ImageItem,
@@ -54,7 +55,19 @@ export async function renderPage(
 	canvas.height = Math.max(1, Math.round(page.height * scale));
 	ctx.setTransform(scale, 0, 0, scale, 0, 0);
 	ctx.clearRect(0, 0, page.width, page.height);
+	return drawPage(ctx, page, style, assetUrls, pdf, text, math);
+}
 
+// Draw one page in page units onto `ctx`: a canvas, or an SvgContext recording it as vectors.
+export async function drawPage(
+	ctx: CanvasRenderingContext2D,
+	page: Page,
+	style: PageStyle | undefined,
+	assetUrls: Map<string, string>,
+	pdf: PdfSource | null,
+	text: PageText | null,
+	math: MathSetter,
+): Promise<MathPlacement[]> {
 	const pageStyle = { ...style, ...page.style };
 	if (pdf && page.pdf_page != null) {
 		drawPaper(ctx, page, pageStyle);
@@ -213,6 +226,10 @@ function compositeLayer(
 	blur: number,
 ): void {
 	if (alpha <= 0) return;
+	if (ctx instanceof SvgContext) {
+		ctx.layer(alpha, op, blur, () => fillDiskRibbon(ctx, geom, fill));
+		return;
+	}
 	const layer = new OffscreenCanvas(ctx.canvas.width, ctx.canvas.height);
 	const lctx = layer.getContext("2d");
 	if (!lctx) return;
@@ -382,8 +399,8 @@ function drawShape(ctx: CanvasRenderingContext2D, item: ShapeItem): void {
 		h = Math.abs(ey - sy);
 	const fill = item.fill_rgba;
 
-	const path = new Path2D();
-	const solid = new Path2D();
+	const path = newPath(ctx);
+	const solid = newPath(ctx);
 	switch (item.shape) {
 		case "line":
 			path.moveTo(sx, sy);
@@ -446,6 +463,11 @@ function drawShape(ctx: CanvasRenderingContext2D, item: ShapeItem): void {
 	ctx.setLineDash([]);
 	ctx.stroke(solid);
 	ctx.restore();
+}
+
+// A Path2D, or its recorder when the page is being written as SVG, which cannot read a Path2D back.
+function newPath(ctx: CanvasRenderingContext2D): Path2D {
+	return ctx instanceof SvgContext ? (new SvgPath() as unknown as Path2D) : new Path2D();
 }
 
 // Arrowhead length and tick half-length for the axes and the number line, scaled to `extent`.

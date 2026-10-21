@@ -1,10 +1,12 @@
 import { finishRenderMath, FileView, loadPdfJs, Notice, WorkspaceLeaf, type TFile } from "obsidian";
 import { flowMath, isEmptyFlow } from "./flow.ts";
 import { layoutFlow, type PageFlow } from "./flowLayout.ts";
-import { MathSetter, rasterizeMathLayer } from "./math.ts";
+import { MathSetter, mathLayerSvg, rasterizeMathLayer } from "./math.ts";
 import { parseXNote } from "./parser.ts";
 import { buildPdf, PDF_PRODUCER, rgbaToRgb, type PdfPage } from "./pdf.ts";
-import { renderPage, type PdfSource } from "./renderer.ts";
+import { isOwnPng, tagPng } from "./png.ts";
+import { drawPage, renderPage, type PdfSource } from "./renderer.ts";
+import { SVG_GENERATOR, SvgContext } from "./svgContext.ts";
 import { TextMeasurer } from "./text.ts";
 import type { Page, XNoteDocument } from "./types.ts";
 import type XNotesPlugin from "./main.ts";
@@ -47,6 +49,8 @@ export class XNoteView extends FileView {
 	// Settles once the current file is drawn.
 	private rendered: Promise<void> = Promise.resolve();
 	private exporting = false;
+	// Set when formulas had to be left out of the export in progress.
+	private mathDropped = false;
 
 	constructor(leaf: WorkspaceLeaf, plugin: XNotesPlugin) {
 		super(leaf);
@@ -84,6 +88,8 @@ export class XNoteView extends FileView {
 		this.zoomLabel = bar.createSpan({ cls: "xnote-zoom-label", text: "100%" });
 		mkBtn("+", "Zoom in", () => this.setZoom(this.zoom * ZOOM_STEP));
 		mkBtn("PDF", "Export as PDF next to this file", () => void this.exportPdf());
+		mkBtn("PNG", "Export each page as PNG next to this file", () => void this.exportPng());
+		mkBtn("SVG", "Export each page as SVG next to this file", () => void this.exportSvg());
 
 		this.pagesEl = this.contentEl.createDiv({ cls: "xnote-pages" });
 
@@ -291,51 +297,115 @@ export class XNoteView extends FileView {
 		return this.doc?.flow && flowPage ? { flow: this.doc.flow, page: flowPage } : null;
 	}
 
-	// Write every page as a PDF beside the note, e.g. Lecture.xnote -> Lecture.pdf. A PDF of that
-	// name that this plugin did not export is never overwritten; the next free name is taken instead.
-	private async exportPdf(): Promise<void> {
-		const file = this.file;
-		if (!file || this.exporting) return;
-		this.exporting = true;
-		const token = this.loadToken;
-		const progress = new Notice("xNote: exporting PDF…", 0);
-		try {
-			await this.rendered;
-			if (token !== this.loadToken || !this.doc) return;
-			const { manifest } = this.doc;
-			const dpi = manifest.dpi ?? DEFAULT_DPI;
-			const wraps = this.pagesEl.querySelectorAll(".xnote-page");
+	// Write every page as a PDF beside the note, e.g. Lecture.xnote -> Lecture.pdf.
+	private exportPdf(): Promise<void> {
+		return this.runExport("PDF", async (file, dpi) => {
 			const pages: PdfPage[] = [];
-			let mathDropped = false;
-			for (let i = 0; i < manifest.pages.length; i++) {
-				const page = manifest.pages[i];
-				let rgba: Uint8ClampedArray;
-				let canvas = await this.exportCanvas(i, dpi, wraps[i]?.querySelector<HTMLElement>(".xnote-math-layer") ?? null);
-				try {
-					rgba = canvasPixels(canvas);
-				} catch {
-					// Drawing the formulas tainted the canvas on this platform: export the page without them.
-					mathDropped = true;
-					canvas = await this.exportCanvas(i, dpi, null);
-					rgba = canvasPixels(canvas);
-				}
-				if (token !== this.loadToken) return;
+			await this.forEachExportPage((canvas, page) => {
 				pages.push({
 					width: (page.width * 72) / dpi,
 					height: (page.height * 72) / dpi,
 					pixelsWide: canvas.width,
 					pixelsHigh: canvas.height,
-					rgb: rgbaToRgb(rgba),
+					rgb: rgbaToRgb(canvasPixels(canvas)),
 				});
-			}
+				return Promise.resolve();
+			});
 			const bytes = buildPdf(pages);
-			const path = await this.writePdf(file, bytes);
-			new Notice(`xNote: exported ${path}${mathDropped ? " (formulas could not be included)" : ""}`);
+			return [await this.writeBeside(fileStem(file), "pdf", bytes, isOwnPdf)];
+		});
+	}
+
+	// Write each page as a PNG beside the note: Lecture.png, or Lecture-1.png, Lecture-2.png, ...
+	private exportPng(): Promise<void> {
+		return this.runExport("PNG", async (file) => {
+			const paths: string[] = [];
+			const multi = (this.doc?.manifest.pages.length ?? 0) > 1;
+			await this.forEachExportPage(async (canvas, _page, i) => {
+				const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
+				if (!blob) throw new Error(`could not encode page ${i + 1}`);
+				const png = tagPng(new Uint8Array(await blob.arrayBuffer()));
+				const base = multi ? `${fileStem(file)}-${i + 1}` : fileStem(file);
+				paths.push(await this.writeBeside(base, "png", png, isOwnPng));
+			});
+			return paths;
+		});
+	}
+
+	// Write each page as a vector SVG beside the note, named like the PNG export. Ink, shapes, text and
+	// the ruling are paths; images and a source PDF page stay embedded rasters.
+	private exportSvg(): Promise<void> {
+		return this.runExport("SVG", async (file, dpi) => {
+			const doc = this.doc;
+			if (!doc) return [];
+			const token = this.loadToken;
+			const { pages, style } = doc.manifest;
+			const wraps = this.pagesEl.querySelectorAll(".xnote-page");
+			const enc = new TextEncoder();
+			const paths: string[] = [];
+			for (let i = 0; i < pages.length; i++) {
+				const page = pages[i];
+				const svg = new SvgContext(page.width, page.height, capScale(page, EXPORT_DPI / dpi));
+				const ctx = svg as unknown as CanvasRenderingContext2D;
+				await drawPage(ctx, page, style, this.assetUrls, this.pdf, this.pageText(i), this.math);
+				const layer = wraps[i]?.querySelector<HTMLElement>(".xnote-math-layer");
+				const math = layer ? await mathLayerSvg(layer, page.width, page.height) : null;
+				if (math) {
+					svg.appendMarkup(
+						`<image x="0" y="0" width="${page.width}" height="${page.height}" href="data:image/svg+xml;charset=utf-8,${encodeURIComponent(math)}"/>`,
+					);
+				}
+				const markup = await svg.serialize();
+				if (token !== this.loadToken) throw new Error("the note was closed");
+				const base = pages.length > 1 ? `${fileStem(file)}-${i + 1}` : fileStem(file);
+				paths.push(await this.writeBeside(base, "svg", enc.encode(markup), isOwnSvg));
+			}
+			return paths;
+		});
+	}
+
+	// Shared export wrapper: waits for the render, reports progress and the files written. A file
+	// of the target name that this plugin did not export is never overwritten; the next free name is
+	// taken instead.
+	private async runExport(kind: string, write: (file: TFile, dpi: number) => Promise<string[]>): Promise<void> {
+		const file = this.file;
+		if (!file || this.exporting) return;
+		this.exporting = true;
+		this.mathDropped = false;
+		const token = this.loadToken;
+		const progress = new Notice(`xNote: exporting ${kind}…`, 0);
+		try {
+			await this.rendered;
+			if (token !== this.loadToken || !this.doc) return;
+			const paths = await write(file, this.doc.manifest.dpi ?? DEFAULT_DPI);
+			const where = paths.length === 1 ? paths[0] : `${paths.length} files beside ${file.name}`;
+			new Notice(`xNote: exported ${where}${this.mathDropped ? " (formulas could not be included)" : ""}`);
 		} catch (e) {
-			new Notice(`xNote: PDF export failed: ${(e as Error).message}`);
+			new Notice(`xNote: ${kind} export failed: ${(e as Error).message}`);
 		} finally {
 			progress.hide();
 			this.exporting = false;
+		}
+	}
+
+	// Render each page at export resolution in turn, stopping if another file is loaded meanwhile.
+	private async forEachExportPage(
+		use: (canvas: HTMLCanvasElement, page: Page, i: number) => Promise<void>,
+	): Promise<void> {
+		const token = this.loadToken;
+		const doc = this.doc;
+		if (!doc) return;
+		const dpi = doc.manifest.dpi ?? DEFAULT_DPI;
+		const wraps = this.pagesEl.querySelectorAll(".xnote-page");
+		for (let i = 0; i < doc.manifest.pages.length; i++) {
+			let canvas = await this.exportCanvas(i, dpi, wraps[i]?.querySelector<HTMLElement>(".xnote-math-layer") ?? null);
+			if (isTainted(canvas)) {
+				// Drawing the formulas tainted the canvas on this platform: export the page without them.
+				this.mathDropped = true;
+				canvas = await this.exportCanvas(i, dpi, null);
+			}
+			if (token !== this.loadToken) throw new Error("the note was closed");
+			await use(canvas, doc.manifest.pages[i], i);
 		}
 	}
 
@@ -363,17 +433,21 @@ export class XNoteView extends FileView {
 		return canvas;
 	}
 
-	private async writePdf(file: TFile, bytes: Uint8Array): Promise<string> {
-		const stem = file.path.slice(0, file.path.length - file.extension.length - 1);
+	private async writeBeside(
+		base: string,
+		ext: string,
+		bytes: Uint8Array,
+		isOwn: (data: ArrayBuffer) => boolean,
+	): Promise<string> {
 		const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 		for (let n = 0; ; n++) {
-			const path = n === 0 ? `${stem}.pdf` : `${stem} ${n}.pdf`;
+			const path = n === 0 ? `${base}.${ext}` : `${base} ${n}.${ext}`;
 			const existing = this.app.vault.getFileByPath(path);
 			if (!existing) {
 				await this.app.vault.createBinary(path, data);
 				return path;
 			}
-			if (isOwnExport(await this.app.vault.readBinary(existing))) {
+			if (isOwn(await this.app.vault.readBinary(existing))) {
 				await this.app.vault.modifyBinary(existing, data);
 				return path;
 			}
@@ -434,14 +508,35 @@ function capScale(page: Page, scale: number): number {
 	);
 }
 
+// The note's path without its extension: folder/Lecture.xnote -> folder/Lecture.
+function fileStem(file: TFile): string {
+	return file.path.slice(0, file.path.length - file.extension.length - 1);
+}
+
+// Whether the canvas's pixels can no longer be read back, as after drawing a tainting image.
+function isTainted(canvas: HTMLCanvasElement): boolean {
+	try {
+		canvas.getContext("2d")?.getImageData(0, 0, 1, 1);
+		return false;
+	} catch {
+		return true;
+	}
+}
+
 function canvasPixels(canvas: HTMLCanvasElement): Uint8ClampedArray {
 	const ctx = canvas.getContext("2d");
 	if (!ctx) throw new Error("2D canvas context unavailable");
 	return ctx.getImageData(0, 0, canvas.width, canvas.height).data;
 }
 
+// Whether an SVG was written by this plugin's export, which names itself in a comment up top.
+function isOwnSvg(data: ArrayBuffer): boolean {
+	const head = new Uint8Array(data, 0, Math.min(data.byteLength, 256));
+	return new TextDecoder().decode(head).includes(SVG_GENERATOR);
+}
+
 // Whether a PDF was written by this plugin's export, which names itself in the Info dictionary.
-function isOwnExport(data: ArrayBuffer): boolean {
+function isOwnPdf(data: ArrayBuffer): boolean {
 	const head = new Uint8Array(data, 0, Math.min(data.byteLength, 1024));
 	return new TextDecoder("latin1").decode(head).includes(`/Producer (${PDF_PRODUCER})`);
 }

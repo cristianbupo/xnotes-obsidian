@@ -126,20 +126,28 @@ const LAYER_CSS =
 	".xnote-math{position:absolute;white-space:nowrap;font-family:serif;line-height:normal}" +
 	".xnote-math-strut{display:inline-block;width:0;height:0}";
 
-// A page's mounted formulas as one image, for drawing into an exported page. The layer is
-// serialized into an SVG foreignObject with MathJax's rules and fonts inlined, since an SVG
-// image loads nothing of its own. Null when the layer is empty or the image will not load.
-export async function rasterizeMathLayer(layer: HTMLElement, width: number, height: number): Promise<HTMLImageElement | null> {
+// A page's mounted formulas as a standalone SVG: the layer serialized into a foreignObject with
+// MathJax's rules and fonts inlined, since an SVG image loads nothing of its own. Null when the
+// layer is empty.
+export async function mathLayerSvg(layer: HTMLElement, width: number, height: number): Promise<string | null> {
 	if (!layer.hasChildNodes()) return null;
 	const clone = layer.cloneNode(true) as HTMLElement;
 	clone.setCssStyles({ position: "absolute", top: "0", left: "0", transform: "none" });
 	const css = LAYER_CSS + (await mathCss(layer.doc));
-	const svg =
+	return (
 		`<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}">` +
 		`<foreignObject x="0" y="0" width="${width}" height="${height}">` +
 		`<div xmlns="http://www.w3.org/1999/xhtml" style="position:relative;width:${width}px;height:${height}px">` +
 		`<style><![CDATA[${css}]]></style>${new XMLSerializer().serializeToString(clone)}</div>` +
-		`</foreignObject></svg>`;
+		`</foreignObject></svg>`
+	);
+}
+
+// mathLayerSvg as an image, for drawing into an exported raster page. Null when the layer is
+// empty or the image will not load.
+export async function rasterizeMathLayer(layer: HTMLElement, width: number, height: number): Promise<HTMLImageElement | null> {
+	const svg = await mathLayerSvg(layer, width, height);
+	if (!svg) return null;
 	const img = new Image();
 	try {
 		await new Promise<void>((resolve, reject) => {
